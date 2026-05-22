@@ -2,9 +2,11 @@
 CR3BP environment validation.
 
 Validates:
-  1. Jacobi integral conservation over long unforced trajectories (drift < 1e-10)
-  2. Known L2 Lyapunov orbit reproduction
-  3. Correct equations of motion (compare against analytic properties)
+  1. Jacobi integral conservation over 100 unforced orbital periods (drift < 1e-10)
+  2. Libration point equilibria (L1-L5 acceleration residuals)
+  3. Near-L1 Lyapunov orbit return-map closure
+
+Integrator: DOP853 (diffrax.Dopri8, rtol=1e-12, atol=1e-14, float64).
 
 Run: python -m envs.cr3bp_validation
 """
@@ -15,7 +17,12 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
+import diffrax
 
+
+# ---------------------------------------------------------------------------
+# Core CR3BP functions (pure, float64)
+# ---------------------------------------------------------------------------
 
 def cr3bp_deriv(state, mu):
     """CR3BP equations of motion in rotating frame (pure function, float64)."""
@@ -28,7 +35,7 @@ def cr3bp_deriv(state, mu):
 
 
 def jacobi_constant(state, mu):
-    """Compute Jacobi integral C = 2U - v², should be conserved."""
+    """Compute Jacobi integral C = 2U - v², conserved in unforced CR3BP."""
     x, y, xd, yd = state
     r1 = jnp.sqrt((x + mu) ** 2 + y ** 2)
     r2 = jnp.sqrt((x - 1.0 + mu) ** 2 + y ** 2)
@@ -37,84 +44,104 @@ def jacobi_constant(state, mu):
     return 2 * U - v2
 
 
-def rk78_step(state, mu, dt):
-    """Dormand-Prince RK7(8) step (simplified as RK4 here; upgrade to diffrax DOP853 later)."""
-    # For validation, use very small dt with RK4 to approximate high-order integrator
-    def f(s):
+# ---------------------------------------------------------------------------
+# DOP853 integrator (replaces RK4 placeholder)
+# ---------------------------------------------------------------------------
+
+def integrate_trajectory(state0, mu, t1, n_save=1001):
+    """Integrate unforced CR3BP with DOP853 (diffrax.Dopri8).
+
+    Args:
+        state0: Initial state (4,): (x, y, xdot, ydot)
+        mu: Mass ratio (float)
+        t1: End time in TU (float)
+        n_save: Number of equally-spaced save points (including t=0)
+
+    Returns:
+        states: (n_save, 4)
+        jacobi: (n_save,) Jacobi constant at each saved time
+    """
+    ts = jnp.linspace(0.0, float(t1), n_save)
+
+    def vector_field(t, s, args):
         return cr3bp_deriv(s, mu)
-    k1 = f(state)
-    k2 = f(state + 0.5 * dt * k1)
-    k3 = f(state + 0.5 * dt * k2)
-    k4 = f(state + dt * k3)
-    return state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+    term = diffrax.ODETerm(vector_field)
+    solver = diffrax.Dopri8()
+    controller = diffrax.PIDController(rtol=1e-14, atol=1e-16)
+    saveat = diffrax.SaveAt(ts=ts)
+
+    solution = diffrax.diffeqsolve(
+        term,
+        solver,
+        t0=0.0,
+        t1=float(t1),
+        dt0=float(t1) / 1000.0,
+        y0=state0,
+        args=None,
+        stepsize_controller=controller,
+        saveat=saveat,
+        max_steps=500_000,
+    )
+    states = solution.ys  # (n_save, 4)
+    jacobi_vals = jax.vmap(lambda s: jacobi_constant(s, mu))(states)
+    return states, jacobi_vals
 
 
-def integrate_trajectory(state0, mu, dt, n_steps):
-    """Integrate CR3BP trajectory, recording state and Jacobi constant."""
-    states = [state0]
-    jacobi = [jacobi_constant(state0, mu)]
-
-    state = state0
-    for _ in range(n_steps):
-        state = rk78_step(state, mu, dt)
-        states.append(state)
-        jacobi.append(jacobi_constant(state, mu))
-
-    return jnp.array(states), jnp.array(jacobi)
-
+# ---------------------------------------------------------------------------
+# Validation routines
+# ---------------------------------------------------------------------------
 
 def validate_jacobi_conservation(
     mu: float = 0.01215,
-    dt: float = 1e-3,
-    n_periods: int = 10,
+    n_periods: int = 100,
 ):
-    """Validate Jacobi integral conservation on a near-L2 trajectory."""
-    print(f"CR3BP Validation: μ={mu}, dt={dt}")
+    """Validate Jacobi integral conservation over 100 orbital periods.
 
-    # Initial condition near L2 point
-    # For Earth-Moon, L2 is approximately at x ≈ 1.1557
-    # Use a simple initial condition with known dynamics
-    x_L2 = 1.0 + (mu / 3) ** (1.0 / 3.0)  # Richardson approximation for L2
+    Target: max |ΔC| < 1e-10 (plan requirement for DOP853 environment integrator).
+    Uses the same initial condition as the environment (near L2, quasi-periodic).
+    """
+    print(f"CR3BP Validation: μ={mu}, n_periods={n_periods}")
+
+    # Approximate L2 position (Richardson 1st-order: gamma = (mu/3)^(1/3))
+    x_L2 = 1.0 + (mu / 3) ** (1.0 / 3.0)
     print(f"  Approximate L2 position: x = {x_L2:.6f}")
 
-    # Start slightly off L2 with some velocity (quasi-periodic orbit)
+    # Small-amplitude Lyapunov orbit near L2 (quasi-periodic, unforced)
     state0 = jnp.array([x_L2 + 0.01, 0.0, 0.0, 0.1])
 
-    # One "period" is roughly 2π TU for orbits near L2
-    T_period = 2 * jnp.pi
-    n_steps = int(n_periods * T_period / dt)
-    print(f"  Integrating for {n_periods} periods ({n_steps} steps)...")
+    # Near-L2 orbital period ≈ 2π TU
+    T_period = 2.0 * float(jnp.pi)
+    t1 = n_periods * T_period
+    n_save = n_periods * 20 + 1  # 20 points per period — enough for drift tracking
 
-    states, jacobi = integrate_trajectory(state0, mu, dt, n_steps)
+    print(f"  Integrating for {n_periods} periods (t1={t1:.2f} TU, {n_save} save points)...")
+
+    states, jacobi = integrate_trajectory(state0, mu, t1, n_save=n_save)
 
     C0 = jacobi[0]
     drift = jnp.abs(jacobi - C0)
     max_drift = float(jnp.max(drift))
     final_drift = float(drift[-1])
 
-    print(f"  Jacobi constant C₀ = {float(C0):.10f}")
-    print(f"  Max |ΔC| = {max_drift:.2e}")
+    print(f"  Jacobi constant C₀ = {float(C0):.12f}")
+    print(f"  Max |ΔC| over {n_periods} periods = {max_drift:.2e}")
     print(f"  Final |ΔC| = {final_drift:.2e}")
 
-    if max_drift < 1e-6:
-        print("  ✓ Jacobi integral conserved to < 1e-6 (OK for RK4 at dt=1e-3)")
-    elif max_drift < 1e-3:
-        print("  ~ Jacobi drift moderate — upgrade to DOP853 for tighter bounds")
+    if max_drift < 1e-10:
+        print("  ✓ PASS: Jacobi drift < 1e-10 (DOP853 target met)")
+    elif max_drift < 1e-6:
+        print("  ~ PARTIAL: Jacobi drift < 1e-6 (below 1e-10 target — tighten tolerances)")
     else:
-        print("  ✗ Jacobi drift too large — check equations of motion")
+        print("  ✗ FAIL: Jacobi drift too large — check equations of motion or float64")
 
     return states, jacobi, max_drift
 
 
 def validate_libration_points(mu: float = 0.01215):
-    """Verify L1-L5 positions satisfy the equilibrium condition."""
+    """Verify L1-L5 positions satisfy the zero-acceleration equilibrium condition."""
     print(f"\nLibration point validation (μ={mu}):")
 
-    # L1, L2, L3 are on x-axis (y=0)
-    # They satisfy: x - (1-μ)(x+μ)/|x+μ|³ - μ(x-1+μ)/|x-1+μ|³ = 0
-    # with ẋ=ẏ=ẍ=ÿ=0
-
-    # Approximate collinear points
     gamma = (mu / 3) ** (1.0 / 3.0)
     L1_approx = 1.0 - mu - gamma
     L2_approx = 1.0 - mu + gamma
@@ -125,106 +152,101 @@ def validate_libration_points(mu: float = 0.01215):
         accel = cr3bp_deriv(state, mu)
         residual = float(jnp.sqrt(accel[2]**2 + accel[3]**2))
         C = float(jacobi_constant(state, mu))
-        print(f"  {name}: x={float(x_approx):.6f}, residual={residual:.4e}, C={C:.6f}")
+        print(f"  {name}: x={float(x_approx):.6f}, accel_residual={residual:.4e}, C={C:.6f}")
 
-    # L4, L5 are equilateral triangle points
-    L4 = jnp.array([0.5 - mu, jnp.sqrt(3) / 2, 0.0, 0.0])
-    L5 = jnp.array([0.5 - mu, -jnp.sqrt(3) / 2, 0.0, 0.0])
+    L4 = jnp.array([0.5 - mu, float(jnp.sqrt(3.0)) / 2, 0.0, 0.0])
+    L5 = jnp.array([0.5 - mu, -float(jnp.sqrt(3.0)) / 2, 0.0, 0.0])
 
     for name, state in [("L4", L4), ("L5", L5)]:
         accel = cr3bp_deriv(state, mu)
         residual = float(jnp.sqrt(accel[2]**2 + accel[3]**2))
         C = float(jacobi_constant(state, mu))
         print(f"  {name}: (x,y)=({float(state[0]):.4f},{float(state[1]):.4f}), "
-              f"residual={residual:.4e}, C={C:.6f}")
+              f"accel_residual={residual:.4e}, C={C:.6f}")
 
 
 def validate_known_periodic_orbit(mu: float = 0.01215):
-    """Validate against a known L1 Lyapunov orbit.
+    """Validate near-L1 Lyapunov orbit closure with DOP853.
 
-    Uses Richardson (1980) 3rd-order approximation for L1 Lyapunov orbit IC.
-    The orbit should return close to its starting point after one period.
+    Checks:
+    - Jacobi constant conserved to < 1e-10 over one period
+    - Orbit returns near its starting point (return-map closure)
     """
     print(f"\nPeriodic orbit validation (μ={mu}):")
 
-    # Simple L1 Lyapunov orbit IC (approximate)
-    # These are well-known for Earth-Moon system
     gamma = (mu / 3) ** (1.0 / 3.0)
     x_L1 = 1.0 - mu - gamma
 
     # Small-amplitude Lyapunov orbit near L1
-    # Linearized period: T ≈ 2π / ω where ω depends on the eigenvalues at L1
-    # For Earth-Moon, T_L1 ≈ 2.77 TU
-    Ax = 0.005  # small amplitude
-    state0 = jnp.array([x_L1 + Ax, 0.0, 0.0, 0.0])
-
-    # Need to find vy that gives a periodic orbit — use a simple crossing condition
-    # For now, use a known approximate value
-    # vy ≈ -Ax * ω where ω is the linearized frequency
-    # At L1, the eigenvalues give ω ≈ 2.0 for Earth-Moon
+    Ax = 0.005
     vy_guess = -Ax * 2.0
-    state0 = state0.at[3].set(vy_guess)
+    state0 = jnp.array([x_L1 + Ax, 0.0, 0.0, vy_guess])
 
     T_guess = 3.0  # approximate period in TU
-    dt = 1e-4
-    n_steps = int(T_guess / dt)
+    n_save = 30001  # dt_eff = 1e-4 TU
 
-    states, jacobi = integrate_trajectory(state0, mu, dt, n_steps)
-
-    # Check how close we return to the x-axis (y=0 crossing)
-    y_vals = states[:, 1]
-    # Find zero crossings of y
-    crossings = jnp.where(y_vals[:-1] * y_vals[1:] < 0)[0]
+    states, jacobi = integrate_trajectory(state0, mu, T_guess, n_save=n_save)
+    ts = jnp.linspace(0.0, T_guess, n_save)
 
     C0 = float(jacobi[0])
     max_drift = float(jnp.max(jnp.abs(jacobi - C0)))
 
+    # Find y=0 crossings (Poincaré section)
+    y_vals = states[:, 1]
+    crossings = jnp.where(y_vals[:-1] * y_vals[1:] < 0)[0]
+
     print(f"  IC: x={float(state0[0]):.6f}, vy={float(state0[3]):.6f}")
-    print(f"  Jacobi C₀ = {C0:.8f}, max |ΔC| = {max_drift:.2e}")
+    print(f"  Jacobi C₀ = {C0:.10f}, max |ΔC| = {max_drift:.2e}")
     print(f"  y-axis crossings found: {len(crossings)}")
 
     if len(crossings) >= 2:
-        # Distance between first and closest return
-        return_idx = crossings[1] if len(crossings) > 1 else -1
+        return_idx = int(crossings[1])
         return_state = states[return_idx]
+        t_return = float(ts[return_idx])
         distance = float(jnp.sqrt(
             (return_state[0] - state0[0])**2 + (return_state[1] - state0[1])**2
         ))
-        print(f"  Return distance at crossing {return_idx} (t={return_idx*dt:.3f}): {distance:.4e}")
+        print(f"  Return at t={t_return:.4f} TU: Euclidean distance={distance:.4e}")
+        if distance < 0.01:
+            print("  ✓ Orbit closes to within 0.01 DU (good for linearized IC)")
     else:
-        print("  (no return crossing found — orbit may be escaping)")
+        print("  (no return crossing — orbit may be escaping or IC needs refinement)")
 
     return states, jacobi
 
 
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
+
 def plot_validation(states, jacobi, save_path="figures/cr3bp_validation.png", mu=0.01215):
-    """Plot trajectory and Jacobi constant evolution."""
+    """Plot trajectory, Jacobi drift, and phase space."""
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
-    # Trajectory in rotating frame
     ax = axes[0]
     ax.plot(states[:, 0], states[:, 1], "b-", linewidth=0.3, alpha=0.7)
-    ax.plot(states[0, 0], states[0, 1], "go", markersize=6, label="start")
+    ax.plot(float(states[0, 0]), float(states[0, 1]), "go", markersize=6, label="start")
     ax.plot(-mu, 0, "ko", markersize=8, label="Earth")
     ax.plot(1 - mu, 0, "o", color="gray", markersize=5, label="Moon")
     ax.set_xlabel("x (rotating frame)")
     ax.set_ylabel("y (rotating frame)")
-    ax.set_title("CR3BP trajectory")
+    ax.set_title("CR3BP trajectory (100 periods)")
     ax.legend(fontsize=8)
     ax.set_aspect("equal")
 
-    # Jacobi constant
     ax = axes[1]
     C0 = jacobi[0]
-    ax.plot(jnp.abs(jacobi - C0), "b-", linewidth=0.5)
-    ax.set_xlabel("time step")
+    drift = jnp.abs(jacobi - C0)
+    ax.plot(np.array(drift), "b-", linewidth=0.5)
+    ax.axhline(1e-10, color="r", linestyle="--", alpha=0.7, label="target 1e-10")
+    ax.set_xlabel("save index")
     ax.set_ylabel("|C(t) - C₀|")
-    ax.set_title("Jacobi integral drift")
+    ax.set_title("Jacobi integral drift (DOP853)")
     ax.set_yscale("log")
+    ax.legend(fontsize=8)
 
-    # Phase space
     ax = axes[2]
-    ax.plot(states[:, 0], states[:, 2], "b-", linewidth=0.3, alpha=0.5)
+    ax.plot(np.array(states[:, 0]), np.array(states[:, 2]), "b-", linewidth=0.3, alpha=0.5)
     ax.set_xlabel("x")
     ax.set_ylabel("ẋ")
     ax.set_title("Phase space (x, ẋ)")
@@ -235,25 +257,29 @@ def plot_validation(states, jacobi, save_path="figures/cr3bp_validation.png", mu
     plt.close()
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     import os
     os.makedirs("figures", exist_ok=True)
 
-    # 1. Jacobi conservation
-    states, jacobi, max_drift = validate_jacobi_conservation(
-        dt=1e-3, n_periods=10
-    )
+    # 1. Jacobi conservation over 100 periods (primary target)
+    states, jacobi, max_drift = validate_jacobi_conservation(n_periods=100)
     plot_validation(states, jacobi, save_path="figures/cr3bp_validation.png")
 
-    # 2. Libration points
+    # 2. Libration point equilibria
     validate_libration_points()
 
-    # 3. Periodic orbit
-    states_orbit, jacobi_orbit = validate_known_periodic_orbit()
+    # 3. Near-L1 Lyapunov orbit closure
+    validate_known_periodic_orbit()
 
     print("\n=== CR3BP Validation Summary ===")
-    print(f"  Max Jacobi drift: {max_drift:.2e}")
-    if max_drift < 1e-6:
-        print("  PASS: Jacobi integral well conserved")
+    print(f"  Max Jacobi drift (100 periods): {max_drift:.2e}")
+    if max_drift < 1e-10:
+        print("  PASS ✓  Jacobi drift < 1e-10")
+    elif max_drift < 1e-6:
+        print("  PARTIAL  Jacobi drift < 1e-6 (below 1e-10 target)")
     else:
-        print("  WARN: Consider smaller dt or higher-order integrator (DOP853)")
+        print("  FAIL    Check equations of motion or float64 precision")

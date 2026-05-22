@@ -17,6 +17,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from functools import partial
+import diffrax
 
 
 class CR3BPEnv(gym.Env):
@@ -44,7 +45,7 @@ class CR3BPEnv(gym.Env):
         self.episode_length = episode_length
 
         # L2 halo orbit reference (approximate, to be refined in validation)
-        self.r_halo = jnp.array([1.15, 0.0])  # placeholder L2 position
+        self.r_halo = jnp.array([1.1557, 0.0])  # Earth-Moon L2 (non-dim, Richardson approx)
 
         # Gym spaces: state = (x, y, xdot, ydot, fuel)
         self.observation_space = spaces.Box(
@@ -88,44 +89,55 @@ class CR3BPEnv(gym.Env):
     def _integrate_step(
         self, state: jnp.ndarray, thrust: jnp.ndarray
     ) -> jnp.ndarray:
-        """RK4 integration of CR3BP equations of motion (placeholder for DOP853)."""
+        """DOP853 integration of CR3BP equations of motion (diffrax.Dopri8).
+
+        Uses adaptive sub-stepping within each environment dt for orbital-mechanics
+        accuracy. rtol=1e-10, atol=1e-12 ensures Jacobi drift < 1e-10 per step.
+        """
         s = state[:4]
         fuel = state[4]
+        mu = self.mu
+        dt = self.dt
 
-        def deriv(s, thrust):
-            x, y, xd, yd = s
-            mu = self.mu
-
-            # Distances to primaries
-            r1 = jnp.sqrt((x + mu) ** 2 + y**2)
-            r2 = jnp.sqrt((x - 1.0 + mu) ** 2 + y**2)
-
-            # CR3BP equations of motion in rotating frame
+        def vector_field(t, y, args):
+            x, y_, xd, yd = y
+            thrust_ = args
+            r1 = jnp.sqrt((x + mu) ** 2 + y_ ** 2)
+            r2 = jnp.sqrt((x - 1.0 + mu) ** 2 + y_ ** 2)
             xdd = (
                 2 * yd + x
-                - (1 - mu) * (x + mu) / r1**3
-                - mu * (x - 1.0 + mu) / r2**3
-                + thrust[0]
+                - (1 - mu) * (x + mu) / r1 ** 3
+                - mu * (x - 1.0 + mu) / r2 ** 3
+                + thrust_[0]
             )
             ydd = (
-                -2 * xd + y
-                - (1 - mu) * y / r1**3
-                - mu * y / r2**3
-                + thrust[1]
+                -2 * xd + y_
+                - (1 - mu) * y_ / r1 ** 3
+                - mu * y_ / r2 ** 3
+                + thrust_[1]
             )
             return jnp.array([xd, yd, xdd, ydd])
 
-        # RK4
-        k1 = deriv(s, thrust)
-        k2 = deriv(s + 0.5 * self.dt * k1, thrust)
-        k3 = deriv(s + 0.5 * self.dt * k2, thrust)
-        k4 = deriv(s + self.dt * k3, thrust)
-        s_new = s + (self.dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+        term = diffrax.ODETerm(vector_field)
+        solver = diffrax.Dopri8()
+        controller = diffrax.PIDController(rtol=1e-10, atol=1e-12)
+        saveat = diffrax.SaveAt(t1=True)
 
-        # Fuel consumption
-        fuel_new = fuel - self.dt * jnp.sum(jnp.abs(thrust))
-        fuel_new = jnp.clip(fuel_new, 0.0, 1.0)
+        solution = diffrax.diffeqsolve(
+            term,
+            solver,
+            t0=0.0,
+            t1=dt,
+            dt0=dt / 10.0,
+            y0=s,
+            args=thrust,
+            stepsize_controller=controller,
+            saveat=saveat,
+            max_steps=1024,
+        )
+        s_new = solution.ys[0]  # (4,) — state at t=dt
 
+        fuel_new = jnp.clip(fuel - dt * jnp.sum(jnp.abs(thrust)), 0.0, 1.0)
         return jnp.concatenate([s_new, jnp.array([fuel_new])])
 
     def jacobi_constant(self, state: jnp.ndarray | None = None) -> float:
