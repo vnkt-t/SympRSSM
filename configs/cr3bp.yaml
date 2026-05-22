@@ -1,0 +1,38 @@
+# CR3BP station-keeping experiment configuration
+env:
+  name: cr3bp
+  mu: 0.01215
+  dt: 0.01
+  T_max: 0.01
+  fuel_penalty: 0.1
+  episode_length: 500
+
+model:
+  q_dim: 64
+  p_dim: 64
+  stoch_dim: 32
+  stoch_classes: 32
+  hamiltonian_hidden: 128
+  integrator: yoshida4
+  integrator_dt: 1.0
+  noether_projection: true
+  noether_type: newton     # Jacobi integral (quadratic)
+
+training:
+  seed: 0
+  n_seeds: 5
+  total_env_steps: 300_000
+  batch_size: 16
+  seq_length: 50
+  imagination_horizon: 15
+  lr_world: 1.0e-4
+  lr_actor: 3.0e-5
+  lr_critic: 3.0e-5
+  grad_clip: 100.0
+  kl_balance: 0.8
+  precision: float32
+
+eval:
+  rollout_length: 1000
+  n_eval_episodes: 20
+  ood_mu: [0.006, 0.009, 0.01215, 0.015, 0.020]

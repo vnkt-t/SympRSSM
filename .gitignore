@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# JAX/ML artifacts
+wandb/
+checkpoints/
+logs/
+*.ckpt
+*.pkl
+
+# Figures (generated)
+figures/*.png
+figures/*.pdf
+!figures/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Local Claude Code session data
+.claude/
+
+# Project-internal docs (not for public repo)
+CLAUDE.md
+COMPUTE_WORKFLOW.md
+research_loop.sh
+
+# Draft/alternate files
+*_other.md
+*_other.sh
+
+# PDF plans
+*.pdf
