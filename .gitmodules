@@ -1,0 +1,3 @@
+[submodule "agents/dreamerv3"]
+	path = agents/dreamerv3
+	url = https://github.com/vnkt-t/dreamerv3
