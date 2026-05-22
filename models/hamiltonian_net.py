@@ -19,20 +19,38 @@ from typing import Optional
 
 
 class SpectralNormedLinear(eqx.Module):
-    """Linear layer with spectral normalization for Lipschitz control."""
+    """Linear layer with optional spectral normalization for Lipschitz control.
+
+    spectral_norm=True  : W / σ(W) at call time — use for full SympDreamer training
+                          to prevent Hamiltonian explosion during RL.
+    spectral_norm=False : plain linear layer with He init — use for Phase 2 sanity
+                          checks where we want H_theta to have real curvature so the
+                          symplectic vs RK4 energy-conservation difference is visible.
+    """
     weight: jnp.ndarray
     bias: jnp.ndarray
+    spectral_norm: bool = eqx.field(static=True)
 
-    def __init__(self, in_features: int, out_features: int, *, key: jax.random.PRNGKey):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        spectral_norm: bool = True,
+        *,
+        key: jax.random.PRNGKey,
+    ):
         wkey, bkey = jax.random.split(key)
-        self.weight = jax.random.normal(wkey, (out_features, in_features)) * 0.01
+        self.weight = jax.random.normal(wkey, (out_features, in_features)) * jnp.sqrt(2.0 / in_features)
         self.bias = jnp.zeros(out_features)
+        self.spectral_norm = spectral_norm
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # Spectral normalization: W / sigma(W)
-        sigma = jnp.linalg.svd(self.weight, compute_uv=False)[0]
-        W_normalized = self.weight / jnp.maximum(sigma, 1e-12)
-        return W_normalized @ x + self.bias
+        if self.spectral_norm:
+            sigma = jnp.linalg.svd(self.weight, compute_uv=False)[0]
+            W = self.weight / jnp.maximum(sigma, 1e-12)
+        else:
+            W = self.weight
+        return W @ x + self.bias
 
 
 class KineticEnergy(eqx.Module):
@@ -66,14 +84,22 @@ class PotentialEnergy(eqx.Module):
     """V_theta(q): Learned potential energy via spectral-normed MLP."""
     layers: list
 
-    def __init__(self, dim: int, hidden: int = 64, n_layers: int = 2, *, key: jax.random.PRNGKey):
+    def __init__(
+        self,
+        dim: int,
+        hidden: int = 64,
+        n_layers: int = 2,
+        spectral_norm: bool = True,
+        *,
+        key: jax.random.PRNGKey,
+    ):
         keys = jax.random.split(key, n_layers + 1)
         self.layers = []
         in_d = dim
         for i in range(n_layers):
-            self.layers.append(SpectralNormedLinear(in_d, hidden, key=keys[i]))
+            self.layers.append(SpectralNormedLinear(in_d, hidden, spectral_norm=spectral_norm, key=keys[i]))
             in_d = hidden
-        self.layers.append(SpectralNormedLinear(in_d, 1, key=keys[-1]))
+        self.layers.append(SpectralNormedLinear(in_d, 1, spectral_norm=spectral_norm, key=keys[-1]))
 
     def __call__(self, q: jnp.ndarray) -> jnp.ndarray:
         x = q
@@ -87,15 +113,22 @@ class ActionCouplingPotential(eqx.Module):
     layers: list
 
     def __init__(
-        self, q_dim: int, a_dim: int, hidden: int = 64, n_layers: int = 2, *, key: jax.random.PRNGKey
+        self,
+        q_dim: int,
+        a_dim: int,
+        hidden: int = 64,
+        n_layers: int = 2,
+        spectral_norm: bool = True,
+        *,
+        key: jax.random.PRNGKey,
     ):
         keys = jax.random.split(key, n_layers + 1)
         in_d = q_dim + a_dim
         self.layers = []
         for i in range(n_layers):
-            self.layers.append(SpectralNormedLinear(in_d, hidden, key=keys[i]))
+            self.layers.append(SpectralNormedLinear(in_d, hidden, spectral_norm=spectral_norm, key=keys[i]))
             in_d = hidden
-        self.layers.append(SpectralNormedLinear(in_d, 1, key=keys[-1]))
+        self.layers.append(SpectralNormedLinear(in_d, 1, spectral_norm=spectral_norm, key=keys[-1]))
 
     def __call__(self, q: jnp.ndarray, a: jnp.ndarray) -> jnp.ndarray:
         x = jnp.concatenate([q, a], axis=-1)
@@ -119,6 +152,7 @@ class HamiltonianNet(eqx.Module):
         p_dim: int,
         a_dim: int,
         hidden: int = 64,
+        spectral_norm: bool = True,
         *,
         key: jax.random.PRNGKey,
     ):
@@ -127,8 +161,8 @@ class HamiltonianNet(eqx.Module):
         self.p_dim = p_dim
         self.a_dim = a_dim
         self.kinetic = KineticEnergy(p_dim, key=k1)
-        self.potential = PotentialEnergy(q_dim, hidden=hidden, key=k2)
-        self.coupling = ActionCouplingPotential(q_dim, a_dim, hidden=hidden, key=k3)
+        self.potential = PotentialEnergy(q_dim, hidden=hidden, spectral_norm=spectral_norm, key=k2)
+        self.coupling = ActionCouplingPotential(q_dim, a_dim, hidden=hidden, spectral_norm=spectral_norm, key=k3)
 
     def __call__(self, q: jnp.ndarray, p: jnp.ndarray, a: jnp.ndarray) -> jnp.ndarray:
         return self.kinetic(p) + self.potential(q) + self.coupling(q, a)

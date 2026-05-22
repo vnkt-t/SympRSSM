@@ -124,9 +124,9 @@ def generate_double_pendulum_data(
 
     for k in keys:
         k1, k2 = jax.random.split(k)
-        # Small-amplitude ICs to avoid near-singular configurations
-        q0 = jax.random.uniform(k1, shape=(2,), minval=-0.8, maxval=0.8)
-        p0 = jax.random.uniform(k2, shape=(2,), minval=-0.8, maxval=0.8)
+        # Moderate-energy ICs to ensure chaotic regime (H > 0 needed for chaos)
+        q0 = jax.random.uniform(k1, shape=(2,), minval=-1.2, maxval=1.2)
+        p0 = jax.random.uniform(k2, shape=(2,), minval=-1.2, maxval=1.2)
         state0 = jnp.concatenate([q0, p0])
 
         sol = diffrax.diffeqsolve(

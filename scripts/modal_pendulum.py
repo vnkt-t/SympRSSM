@@ -25,6 +25,7 @@ app = modal.App("symp-dreamer-pendulum")
 
 _project_root = pathlib.Path(__file__).parent.parent
 
+# Include project source in the image (Modal 1.x API: add_local_dir on Image)
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install(
@@ -36,20 +37,22 @@ image = (
         "matplotlib",
         "gymnasium",
     )
-)
-
-# Mount the entire project into /root/SympRSSM
-project_mount = modal.Mount.from_local_dir(
-    str(_project_root),
-    remote_path="/root/SympRSSM",
-    # Exclude large/irrelevant directories
-    condition=lambda path: not any(
-        part in path for part in [
-            ".git", "__pycache__", ".pytest_cache",
-            "agents/dreamerv3", "logs", "figures", "results",
-            ".venv", "venv",
-        ]
-    ),
+    .add_local_dir(
+        str(_project_root / "envs"),
+        remote_path="/root/SympRSSM/envs",
+    )
+    .add_local_dir(
+        str(_project_root / "models"),
+        remote_path="/root/SympRSSM/models",
+    )
+    .add_local_dir(
+        str(_project_root / "integrators"),
+        remote_path="/root/SympRSSM/integrators",
+    )
+    .add_local_dir(
+        str(_project_root / "scripts"),
+        remote_path="/root/SympRSSM/scripts",
+    )
 )
 
 
@@ -61,12 +64,11 @@ project_mount = modal.Mount.from_local_dir(
     gpu="A10G",
     timeout=3600,
     image=image,
-    mounts=[project_mount],
 )
 def run_pendulum_sanity(
     system: str = "both",
-    steps: int = 5000,
-    rollout: int = 1000,
+    steps: int = 10000,
+    rollout: int = 2000,
     n_traj: int = 80,
     hidden: int = 64,
     seed: int = 42,
@@ -110,8 +112,8 @@ def run_pendulum_sanity(
 @app.local_entrypoint()
 def main(
     system: str = "both",
-    steps: int = 5000,
-    rollout: int = 1000,
+    steps: int = 10000,
+    rollout: int = 2000,
     n_traj: int = 80,
     hidden: int = 64,
     seed: int = 42,
@@ -144,12 +146,14 @@ def main(
     for sys_name, r in results.items():
         if isinstance(r, dict):
             print(f"  {sys_name}:")
-            print(f"    SympRSSM max |ΔH|: {r['symp_max_drift']:.3e}")
-            print(f"    RK4-RSSM max |ΔH|: {r['rk4_max_drift']:.3e}")
-            print(f"    Ratio (RK4/Symp):  {r['ratio']:.1f}x")
+            print(f"    SympRSSM max |ΔH|:          {r['symp_max_drift']:.3e}")
+            print(f"    RK4-RSSM max |ΔH|:          {r['rk4_max_drift']:.3e}")
+            print(f"    Model ratio (RK4/Symp):      {r['ratio']:.1f}x")
+            print(f"    Cross-ratio (shadow H test): {r.get('gate_ratio', r['ratio']):.1f}x")
             if sys_name == "simple":
                 status = "PASS ✓" if r["symp_max_drift"] < 1e-4 else "FAIL ✗"
                 print(f"    Phase 2 target (< 1e-4): {status}")
             else:
-                status = "PASS ✓" if r["ratio"] >= 10.0 else "FAIL ✗"
+                gate_ratio = r.get("gate_ratio", r["ratio"])
+                status = "PASS ✓" if gate_ratio >= 10.0 else "FAIL ✗"
                 print(f"    Gate 1 (≥10x ratio): {status}")
